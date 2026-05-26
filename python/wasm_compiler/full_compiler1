@@ -1,0 +1,839 @@
+#---------------allocation.py---------------
+import math
+import re
+from utils import *
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from compiler import Compiler
+
+class Allocator:
+    def __init__(self, compiler: "Compiler") -> None:
+        self.compiler = compiler
+
+
+    def def_temps(self, block: CodeBlock, func: Func):
+        def get_reg_count(op: tuple[str, int], inst_name: str):
+            if self.compiler.op_reg_count_cache.get(inst_name, {}).get(op[0], {}).get(op[1]) is not None:
+                return self.compiler.op_reg_count_cache[inst_name][op[0]][op[1]]
+            if inst_name in self.compiler.isa["translation table"]: 
+                highest = 0
+                for line in self.compiler.isa["translation table"][inst_name]:
+                    for reg_i in re.findall(fr"{op[0]}\[{op[1]}\](?:\[(\d+)\])?", line):
+                        if reg_i and int(reg_i) > highest: highest = int(reg_i)
+                highest += 1
+                self.compiler.op_reg_count_cache[inst_name] = {op[0]: {op[1]: highest}}
+                return highest
+
+            # fallback, get inst bit width if it has bitwidth else default to 32
+            inst_width = WASM_INSTRUCTIONS[inst_name][2]
+            if inst_width is None: inst_width = 32
+            return math.ceil(inst_width/self.compiler.hardware["reg width"]) # inst bit width / reg bit width
+
+        def kill_temp(temp: TempVar):
+            # NOTE im not removing temp out of the system just delcaring it's slots clear, useful later if i want it back
+            func.free_regs += temp.regs
+            for r in temp.regs: func.used_regs.pop(r)
+            func.free_slots += temp.spills
+            temp.spills, temp.regs = [], []
+            func.alive_temps.remove(temp)
+
+        def spill_temp(temp: TempVar):
+            nonlocal block
+            slot_n = len(temp.regs)
+            regs = temp.regs
+            kill_temp(temp)
+            temp.spills = self.assign_stack_slots(func, slot_n)
+            block.MIR += self.emit_spill_insts("store", regs, temp.spills)
+
+        def get_regs(amt, temp: TempVar):
+            nonlocal regs_to_push_if_used, func
+            regs = []
+            while amt:
+                if func.free_regs: 
+                    reg = func.free_regs.pop()
+                    func.used_regs[reg] = temp
+                    regs.append(reg)
+                    amt -= 1
+                    continue
+                
+                # no free regs, spill regs
+                # shouldn't spill current temp, check is needed for multi reg assignment
+                victim: TempVar = max((t for t in func.alive_temps if temp != t), key=lambda t: t.last_use_id) 
+                spill_temp(victim)
+            if regs_to_push_if_used:
+                for reg in regs:
+                    if reg in regs_to_push_if_used:
+                        func.regs_to_push.append(reg)
+                        regs_to_push_if_used.remove(reg)
+            return regs
+
+        def alloc_temp(temp: TempVar, amt_regs: int):
+            regs = get_regs(amt_regs, temp)
+            temp.regs = regs
+            func.alive_temps.append(temp)
+            return regs
+
+        # define what regs need to be saved if their used.
+        # free regs contains the regs that params didn't use.
+        regs_to_push_if_used = func.type.free_regs.copy()
+        for (_, res) in func.type.results:
+            for loc in res: 
+                # if result is using a temp reg then that reg isn't temporary and is meant to be overwritten.
+                if isinstance(loc, str) and loc in regs_to_push_if_used: regs_to_push_if_used.remove(loc)
+        
+        for inst in block.IR:
+            if isinstance(inst, CodeBlock): 
+                self.def_temps(inst, func)
+                block.MIR.append(inst)
+                continue
+            if isinstance(inst, str):
+                block.MIR.append(inst)
+                continue
+            
+            # if inst definition needs to spill vals temporarly.
+            spills = self.assign_stack_slots(func, self.compiler.isa["inst spills"].get(inst.name, 0))
+
+            inputs = []
+            for i, temp in enumerate(inst.inputs):
+                if inst.called_func_type:
+                    internal_temp = inst.input_spills.get(temp.name)
+                    if internal_temp: # means input for call is in stack, store input temp into internal temp which simply goes to the call
+                        self.emit_spill_insts("store", temp.regs, internal_temp.spills)
+
+                if temp.regs:
+                    inputs.append(temp.regs)
+                
+                elif temp not in func.alive_temps:   # bring temp back from spill.
+                    regs = alloc_temp(temp, get_reg_count(("in", i), "load"))
+                    inputs.append(regs)
+
+                    block.MIR += self.emit_spill_insts("load", regs, temp.spills)
+                    
+                    temp.spills = []  # not in spill longer.
+                
+                if temp.is_dead(inst.id): # this was the last use.
+                    kill_temp(temp)
+            
+            outputs = []
+            for i, temp in enumerate(inst.outputs):
+                if not temp.regs and not temp.spills:
+                    # normal undefined temp
+                    outputs.append(alloc_temp(temp, get_reg_count(("out", i), inst.name)))
+                
+                # if temp already defined, happens with calls
+                elif temp.regs:
+                    # spill any temps defined to this temps regs
+                    for r in temp.regs:
+                        if r in func.used_regs: spill_temp(func.used_regs[r])
+                    
+                    # add temp to alive temps
+                    if temp not in func.alive_temps: func.alive_temps.append(temp)
+                    
+                    outputs.append(temp.regs)
+                
+                if inst.called_func_type:
+                    internal_temp = inst.output_spills.get(temp.name)
+                    if internal_temp: # means output is in stack, load it back from internal temp to output temp
+                        self.emit_spill_insts("load", temp.regs, internal_temp.spills)
+                
+            block.MIR.append(MIR(inst.name, inst.args, [""], inputs, outputs, type=inst.type, ir=inst, spills=spills))
+
+
+    def def_call_temps(self, block: CodeBlock, func: Func):
+        def def_temp(temp:TempVar, defs):
+            if defs:
+                if isinstance(defs[0], str):
+                    temp.regs = defs
+        
+        for (_, result) in func.type.results[::-1]:
+            def_temp(func.temp_stack.pop(), result)
+
+        for inst in block.IR:
+            if isinstance(inst, CodeBlock): 
+                self.def_call_temps(inst, func)
+                continue
+            if isinstance(inst, str):
+                continue
+            
+            if inst.called_func_type:
+                for i, temp in enumerate(inst.inputs):
+                    def_temp(temp, inst.called_func_type.params[i][1])
+                for i, temp in enumerate(inst.outputs):
+                    def_temp(temp, inst.called_func_type.results[i][1])
+
+
+    def emit_spill_insts(self, inst_name: str, regs, slots):
+        if len(regs) != len(slots): error(self.compiler, "load emission failed because amount of regs didn't match amount of slots to store in.")
+        mir = []
+        for slot, reg in zip(slots, regs):
+            mir.append(MIR(inst_name, [reg, str(slot)]))
+        return mir
+
+
+    def assign_stack_slots(self, func: Func, num_slots):
+        slots = []
+        while num_slots:
+            if func.free_slots: slot = func.free_slots.pop()
+            else:
+                slot = func.stack_offset
+                func.stack_offset += 1
+            slots.append(slot)
+            num_slots -= 1
+        return slots
+
+
+
+#---------------translation.py---------------
+import re
+from utils import *
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from compiler import Compiler
+
+class translator:
+    def __init__(self, compiler: "Compiler") -> None:
+        self.compiler = compiler
+    
+
+    def emit_blocks(self, block: CodeBlock):
+        self.compiler.translated_code.append(block.label + ":")
+        for line in block.MIR:
+            if isinstance(line, CodeBlock):
+                self.emit_blocks(line)
+            elif isinstance(line, str):
+                self.compiler.translated_code.append(line + ":")
+            else:
+                self.compiler.translated_code.extend(line.definition)
+        self.compiler.translated_code.append(block.end_label)
+        self.compiler.translated_code += ["", ""]
+        
+
+    def translate(self, block: CodeBlock, func: Func):
+        for inst in block.MIR:
+            if isinstance(inst, CodeBlock):
+                self.translate(inst, func)
+            elif not isinstance(inst, str):
+                self.translate_inst(inst)
+
+
+    def translate_inst(self, inst: MIR):
+        def validate_ops(inst: MIR, line: str):
+            # validate inputs, outputs, inouts
+            for m in re.finditer(r"(in|out|spill)\[(\d+)\](?:\[(\d+)\])?", line):
+                type = m.group(1); i = int(m.group(2)); ri = m.group(3)
+                if ri: ri = int(ri)
+                if type == "in":
+                    if len(inst.inputs) <= i: error(self.compiler, "input index too high.", line_content="wasm inst:\n" + inst.pretty_MIR() + "\n\ntranlation error line:\n" + line)
+                    if ri and len(inst.inputs[i]) <= ri: error(self.compiler, "input reg index too high.", line_content="wasm inst:\n" + inst.pretty_MIR() + "\n\ntranlation error line:\n" + line, highlight=f"in[{i}][{ri}]")
+                if type == "out":
+                    if len(inst.outputs) <= i: error(self.compiler, "output index too high.", line_content="wasm inst:\n" + inst.pretty_MIR() + "\n\ntranlation error line:\n" + line)
+                    if ri and len(inst.outputs[i]) <= ri: error(self.compiler, "output reg index too high.", line_content="wasm inst:\n" + inst.pretty_MIR() + "\n\ntranlation error line:\n" + line, highlight=f"out[{i}][{ri}]")
+                if type == "spill":
+                    if len(inst.spills) <= i: error(self.compiler, "spill index too high.", line_content="wasm inst:\n" + inst.pretty_MIR() + "\n\ntranlation error line:\n" + line)
+
+        def replace_ops(inst: MIR, line: str):
+            # replace inputs, outputs. TODO inouts
+            for i, inp in enumerate(inst.inputs):
+                for r_i, reg in enumerate(inp):
+                    line = line.replace(f"in[{i}][{r_i}]", reg)
+
+            for i, out in enumerate(inst.outputs):
+                for r_i, reg in enumerate(out):
+                    line = line.replace(f"out[{i}][{r_i}]", reg)
+            
+            for i, arg in enumerate(inst.args):
+                line = line.replace(f"arg[{i}]", arg)
+
+            for i, spill in enumerate(inst.spills):
+                line = line.replace(f"spill[{i}]", str(spill))
+            return line
+            
+        # Look up the translation in your ISA table
+        translation = self.compiler.isa["translation table"].get(inst.name, {})
+        
+        if inst.type: 
+            if inst.type not in translation: error(self.compiler, f"translation for '{inst.name}' doesn't have type '{inst.type}'.")
+            if isinstance(translation, dict):
+                translation = translation[inst.type]
+        
+        # check translation
+        if not translation:
+            error(self.compiler, f"No translation for {inst.name}", fatal_error=False)
+            return []
+
+        for line in translation:
+            validate_ops(inst, line)
+            line_def = replace_ops(inst, line)
+            inst.definition.append(line_def)
+
+
+
+#---------------compiler.py---------------
+import json
+from pathlib import Path
+import re
+from utils import *
+
+required_isa_keys = ("data types", "hardware", "syntax", "translation table", "inst spills")
+required_hw_keys =  ("regs", "address width", "data width", "reg width")
+
+class Compiler:
+    def __init__(self, show_warnings, trace) -> None:
+        self.show_warnings = show_warnings
+        self.translated_code = []   # list of lines
+        self.trace = trace
+        self.tracer = Tracer(self.trace)
+        self.label_nums = {}   
+        self.isa, self.hardware = {}, {}
+        
+    def init_vars(self):
+        self.id = 0
+        self.global_vars = {}
+        self.op_reg_count_cache = {}
+        self.tables: dict[str, Table] = {}
+        self.types = {}
+        self.imported_funcs: list = []
+        self.funcs: list[Func] = []
+        self.stack_pointer = self.hardware.get("stack end")
+
+
+    def run(self, program: Path, isa_file: Path, output_file: Path, wat_src):
+        import frontend as FE
+        import controll_flow as CFP
+        import allocation as ALLOC
+        import translation as TRANS
+
+        self.current_file = isa_file
+        with open(isa_file, "r", encoding="utf-8") as f:
+            isa = json.load(f)
+
+        self.isa, self.hardware = self.load_isa(isa)
+        self.gprs = list(set(self.hardware["regs"]) - set(self.hardware.get("spec regs", [])))
+
+        if program.suffix == ".wat":
+            self.current_file = program
+            wat_src = program.read_text()
+
+        parser = FE.WatParser(self)
+        frontend = FE.Frontend(self)
+        controll_flow = CFP.ControlFlowPipeline(self)
+        allocation = ALLOC.Allocator(self)
+        translation = TRANS.translator(self)
+
+        asts = parser.parse(wat_src)   # now you have a full WAT AST
+        
+        for ast in asts:
+            self.init_vars()
+
+            frontend.walk_node(ast, None) # type: ignore
+            frontend.cut_globals()
+            self.tracer.emit({"generated": {"funcs": [f.trace() for f in self.funcs], "globals": self.global_vars}})
+
+            for func in self.funcs:
+                ir = frontend.generate_IR(func)
+                if not ir: 
+                    self.tracer.emit({f"{func.name}: func empty, skipping steps.": {"ir": format_IR(ir)}})
+                    continue
+                self.tracer.emit({f"{func.name}: generated": {"ir": format_IR(ir)}})
+                frontend.assign_types__convert_floats(ir, func)
+                self.tracer.emit({f"{func.name}: lowered local insts, assigned types": {"ir": format_IR(ir), "params": func.type.params, "locals": func.locals}})
+                controll_flow.make_code_blocks(ir, func)
+                self.tracer.emit({f"{func.name}: generated func_main_block": {"func_main_block": func.block.trace(1)}})
+                controll_flow.label_branches__make_cf_blocks(func.block, func)
+                self.tracer.emit({f"{func.name}: converted branch targets to labels, resolved 'if' and made controll flow blocks": {"func_main_block": func.block.trace(1)}})
+                controll_flow.assign_temp_vars(func.CF[0], func) 
+                self.tracer.emit({f"{func.name}: asigned temporary vals to ir": {"func_main_block": func.block.trace(1)}})
+                controll_flow.resolve_merge_nodes(func.block)
+                self.tracer.emit({f"{func.name}: ressolved merge nodes into moves.": {"func_main_block": func.block.trace(1)}})
+                allocation.def_call_temps(func.block, func)
+                self.tracer.emit({f"{func.name}: defined call instructions temp vals to params and results": func.block.trace(1)})
+                allocation.def_temps(func.block, func)
+                self.tracer.emit({f"{func.name}: defined temp vals": {"func_main_block": func.block.trace(0)}})
+                translation.translate(func.block, func)
+                self.tracer.emit({f"{func.name}: translated ir into mir": {"func_main_block": func.block.trace(0)}})
+                translation.emit_blocks(func.block)
+                self.translated_code += [""*2]
+
+            frontend.emit_data()
+
+        with open(output_file, "w") as f:
+            f.write("\n".join(self.translated_code))
+        
+        if self.trace:
+            with open(str(output_file) + "_trace.json", "w") as f:
+                json.dump(self.tracer.events, f)
+        pass
+
+
+    def load_isa(self, raw_isa):
+        isa = {}
+        # --- Normalize ISA keys using ISA_KEYS ---
+        for token, aliases in ISA_KEYS.items():
+            for alias in aliases:
+                if alias in raw_isa:
+                    isa[token] = raw_isa[alias]
+                    break
+            else:
+                if token in required_isa_keys:
+                    error(self, f"Missing required isa key '{token}'")
+
+        # --- Normalize hardware subkeys ---
+        hw_raw = isa.get("hardware", {})
+        hardware = {}
+        for token, aliases in HARDWARE_KEYS.items():
+            for alias in aliases:
+                if alias in hw_raw:
+                    hardware[token] = hw_raw[alias]
+                    break
+            else:
+                if token in required_hw_keys:
+                    error(self, f"Missing required hardware key '{token}'")
+
+        isa["hardware"] = hardware
+
+        if isinstance(hardware["regs"], int):
+            hardware["regs"] = [f"r{i}" for i in range(hardware["regs"])]
+
+        # --- Syntax validation ---
+        syntax = isa.get("syntax", {})
+        if not isinstance(syntax, dict):
+            error(self, "Syntax must be a dictionary")
+        for instr, ops in syntax.items():
+            if not isinstance(ops, str) and not isinstance(ops, list):
+                error(self, f"Syntax for '{instr}' must be a string or list of strings")
+            if isinstance(ops, list):
+                if not all(isinstance(op, str) for op in ops):
+                    error(self, f"All elements in syntax list for '{instr}' must be strings")
+
+        # --- Translation table validation ---
+        t_table = isa.get("translation table", {})
+        if not isinstance(t_table, dict):
+            error(self, "'translation table' must be a dictionary")
+
+        for instr, translations in t_table.items():
+            if not isinstance(instr, str):
+                error(self, "instruction names in 'translation table' must be strings")
+
+            if isinstance(translations, list):
+                # flat translation list
+                if not all(isinstance(line, str) for line in translations):
+                    error(self, f"All lines in translation list for '{instr}' must be strings")
+            elif isinstance(translations, dict):
+                # subtable by type (e.g., stack/reg)
+                for subkey, sublines in translations.items():
+                    if not isinstance(sublines, list):
+                        error(self, 
+                            f"subtable '{subkey}' for instruction '{instr}' must be a list"
+                        )
+                    if not all(isinstance(line, str) for line in sublines):
+                        error(self, 
+                            f"All lines in subtable '{subkey}' for '{instr}' must be strings"
+                        )
+            else:
+                error(self, f"translation entry for '{instr}' must be a list or dict")
+
+        # --- op reg count validation ---
+        op_reg_count = isa.get("op reg count", {})
+        if not isinstance(op_reg_count, dict):
+            error(self, "'op reg count' must be a dictionary")
+
+        for instr, counts in op_reg_count.items():
+            if not isinstance(instr, str):
+                error(self, "instruction names in 'op reg count' must be strings")
+
+            if not isinstance(counts, dict):
+                error(self, f"'op reg count' for '{instr}' must be a dict")
+
+            if instr not in WASM_INSTRUCTIONS and instr not in CUSTOM_INSTS:
+                error(self, f"'op reg count' refers to unknown instruction '{instr}'")
+
+            for port, width in counts.items():
+                if not isinstance(port, str):
+                    error(self, f"invalid port name in 'op reg count' for '{instr}'")
+
+                if not re.fullmatch(r"(in|out)\d+", port):
+                    error(self, 
+                        f"invalid port '{port}' in 'op reg count' for '{instr}' "
+                        "(expected inN / outN)"
+                    )
+
+                if not isinstance(width, int) or width <= 0:
+                    error(self, 
+                        f"register count for '{instr}:{port}' must be a positive integer"
+                    )
+
+        return isa, isa["hardware"]
+
+
+
+
+#---------------utils.py---------------
+from dataclasses import dataclass, field
+from typing import Optional
+from termcolor import colored
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from data import * 
+
+
+def str_bytes_to_list(data: str, bits: int = 8):
+    """
+Converts a string into packed integers.
+Assumes hex escapes (\\xx), little-endian packing.
+Input is trusted compiler output.
+"""
+
+    size = bits // 8
+    byte_i = curr_num = char_i = 0
+    result: list[str] = []
+
+    while char_i < len(data):
+        char = data[char_i]
+        if char == "\\":
+            if char_i + 2 >= len(data):
+                raise ValueError(f"Invalid escape at position {char_i} in {data}")
+            curr_num += int(data[char_i+1:char_i+3], 16) << (byte_i*8)
+            char_i += 3
+        else:
+            curr_num += ord(char) << (byte_i*8)
+            char_i += 1
+        byte_i += 1
+
+        if byte_i == size:
+            result.append(str(curr_num))
+            curr_num = byte_i = 0
+
+    # Append remaining bytes if not full
+    if byte_i > 0:
+        result.append(str(curr_num))
+
+    return result
+
+def format_IR(ir:   list["IR | str"]):
+    return [inst.pretty_IR() if isinstance(inst, IR) else inst for inst in ir]
+def format_MIR(Mir: list["MIR | str"]):
+    return [inst.pretty_MIR() if isinstance(inst, MIR) else inst for inst in Mir]
+
+def error(compiler, message: str, line_i: Optional[int] = None, line_content: Optional[str] = None, highlight: str = "", is_warning = False, fatal_error = True):
+    # Skip warnings if disabled
+
+    # Severity
+    level_text = "Warning" if is_warning else "Error"
+    level_color = (255, (not fatal_error)*80 + is_warning*160, 0)
+    formatted_level = colored(level_text, level_color, attrs=["bold"])
+
+    # Build context info
+    location = ""
+    location += f" in file {colored(compiler.current_file.name, (0xF4, 0xB2, 0x66), attrs=['underline'])}"
+    
+    if line_i is not None:
+        location += f" at line {colored(line_i+1, 'cyan')}"
+
+    formatted_msg = colored(f">>> {message} <<<", "grey")
+
+    # Print header
+    full_error = f"{formatted_level}{location}:\n{formatted_msg}\n"
+
+    # Print line content with highlighting
+    if line_content:
+        full_error += "\n" + colored(line_content, (144,213,255))
+        if highlight and (idx := line_content.find(highlight)) >= 0:
+            full_error += "\n" + (" " * idx) + colored("^" * len(highlight), "red")
+
+    if fatal_error: raise CompileError(full_error)
+    elif is_warning and compiler.show_warnings or not fatal_error: print(full_error)
+
+
+class CompileError(Exception):
+    pass
+
+
+class Table:
+    def __init__(self, index, min_size, max_size, type) -> None:
+        self.index: str = index
+        self.label: str = f"table{index}"
+        self.min_size: int = min_size
+        self.max_size: int | None = max_size
+        self.type: str = type
+        self.items: list = []
+
+
+@dataclass
+class FuncType:
+    params:  list[tuple[int, list[int] | list[str]]] = field(default_factory=list)
+    results: list[tuple[int, list[int] | list[str]]] = field(default_factory=list)
+    free_regs: list = field(default_factory=list)
+    stack_offset: int = 0   # this is used for param alloc, then becomes funcs default stack offset
+    used_regs: dict = field(default_factory=dict)
+
+
+class TempVar:
+    def __init__(self, name: str, regs: list[str] | None = None, spills: list[int] | None = None):
+        self.name = name
+        self.regs = regs if regs is not None else []
+        self.spills = spills if spills is not None else []
+        self.last_use_id: int = -1
+
+    def is_dead(self, current_id: int | None) -> bool:
+        return current_id is not None and self.last_use_id == current_id 
+
+    def __str__(self) -> str:
+        return self.name
+    
+    def __repr__(self) -> str:
+        return self.name
+
+class Func:
+    def __init__(self, name: str, type, node: "WatNode") -> None:
+        self.name = name
+        self.type: FuncType = type
+        self.locals: list[tuple[int, list]] = []
+        self.node = node
+        self.body: list[str] = node.args[1:]
+        self.indirect_calls_args: list[WatNode] = []
+        self.block: CodeBlock = None # pyright: ignore[reportAttributeAccessIssue]
+        self.CF: list[CF_block] = []
+        self.temp_stack: list[TempVar] = []
+        self.free_slots: list[int] = []
+        self.stack_offset = self.type.stack_offset
+        self.free_regs = self.type.free_regs.copy()
+        self.calls: list[Func] = []  # like children, the funcs this func calls
+        self.temps_defs: dict[str, TempVar] = {}   # temp name: temp
+        self.alive_temps: list[TempVar] = []   # temp name: temp
+        self.temp_counter = 0
+        self.used_regs: dict[str, TempVar] =  {}
+        self.regs_to_push = []   # all the regs we temporarly use
+
+    def new_temp(self):
+        self.temp_stack.append(TempVar(f"t{self.temp_counter}"))
+        self.temp_counter += 1
+        return self.temp_stack[-1]
+
+    def get_next_temp(self):
+        return TempVar(f"t{self.temp_counter}")
+
+    def get_local(self, i):
+        return (self.type.params + self.locals)[i]
+    
+    def __repr__(self) -> str:
+        return (
+            f"Func("
+            f"name: {self.name!r}, "
+            f"params:  {len(self.type.params)}, "
+            f"results: {len(self.type.results)}, "
+            f"locals: {len(self.locals)}, "
+            f"temps: {self.temp_counter}, "
+            f"stack_offset: {self.stack_offset}, "
+            f"calls: {[f.name for f in self.calls]}"
+            f")"
+        )   
+
+    def trace(self) -> dict:
+        return {
+            "name": self.name,
+            "params":  len(self.type.params),
+            "results": len(self.type.results),
+            "locals": len(self.locals),
+            "temps": self.temp_counter,
+            "stack_offset": self.stack_offset,
+            "calls": [f.name for f in self.calls],
+        }
+
+
+class CF_block:
+    def __init__(self, block, label = None) -> None:
+        self.entry_label: str | None = label
+        self.is_branch = False
+        self.IR: list[IR] = []
+        self.entrys: list[CF_block] = []
+        self.exits: list[CF_block] = []  # target_block, exit stack
+        self.output_stack: list[TempVar] = []
+        self.input_stack: list[TempVar] = []   # for move insts move insts will move input stack to output stack
+        self.entry_stack: list[TempVar] = []
+        self.code_block: CodeBlock = block  # where it comes from
+
+    def __repr__(self) -> str:
+        exits_labels = [exit_.entry_label for exit_ in self.exits]
+        return (f"CF_block(label: {self.entry_label!r}, "
+                f"IR: {self.IR}, "
+                f"exits: {exits_labels})")
+
+class CodeBlock:
+    def __init__(self, name, parent) -> None:
+        self.label: str = name
+        self.parent = parent
+        self.IR: list[IR | CodeBlock | str] = []
+        self.else_label: str = ""   # only in if-else
+        self.MIR: list[MIR | CodeBlock | str] = []
+        self.children:list[CodeBlock] = []
+        self.CF: list[CF_block] = []
+        self.end_label: str  = ""
+
+    def get_block(self, parent_i):
+        parent = self
+        while parent_i and parent:
+            parent = parent.parent
+            parent_i -= 1
+        return parent
+
+    def get_IR(self):
+        out = []
+        for line in self.IR:
+            if isinstance(line, CodeBlock): out += line.get_IR()
+            else: out.append(line)
+        return out
+
+    def get_MIR(self):
+        out = []
+        for line in self.MIR:
+            if isinstance(line, CodeBlock): out += line.get_MIR()
+            else: out.append(line)
+        return out
+
+    def __repr__(self) -> str:
+        return (
+            f"CodeBlock("
+            f"label: {self.label!r}, "
+            f"end_label: {self.end_label!r}, "
+            f"else_label: {self.else_label!r}, "
+            f"IR_len: {len(self.IR)}, "
+            f"MIR_len: {len(self.MIR)}, "
+            f"children: {[c.label for c in self.children]}, "
+            f"parent: {getattr(self.parent, 'label', None)!r}, "
+            f")"
+        )
+
+    def trace(self, ret_ir) -> dict:   # ir = true then print ir else mir
+        if ret_ir:
+            opt = []
+            for inst in self.IR:
+                if isinstance(inst, CodeBlock): opt.append(inst.trace(ret_ir))
+                elif isinstance(inst, IR): opt.append(inst.pretty_IR())
+                else: opt.append(inst)
+        else:
+            opt = []
+            for inst in self.MIR:
+                if isinstance(inst, CodeBlock): opt.append(inst.trace(ret_ir))
+                elif isinstance(inst, MIR): opt.append(inst.pretty_MIR())
+                else: opt.append(inst)
+        opt_str = "ir" if ret_ir else "mir"
+        return {
+            "label": self.label,
+            "end_label": self.end_label,
+            "else_label": self.else_label,
+            opt_str: opt
+        }
+    
+
+# represents the wasm
+@dataclass
+class IR:
+    name: str = ""
+    args: list[str] = field(default_factory=list)
+    inputs:  list[TempVar] = field(default_factory=list) 
+    outputs: list[TempVar] = field(default_factory=list) 
+    id: int | None = None
+    type: str | None = None
+    # only in calls
+    called_func_type: FuncType | None = None
+    input_spills:  dict[str, TempVar | None] = field(default_factory=dict) # input temp[i]: spilled temp if any
+    output_spills: dict[str, TempVar | None] = field(default_factory=dict) # output temp[i]: spilled temp if any
+
+
+    def pretty_IR(self) -> str:
+        args = self.args
+
+        lhs = ", ".join(out.name for out in self.outputs)
+        if lhs: lhs += " = "
+        rhs_inputs = ", ".join(inp.name for inp in self.inputs) 
+        rhs_args = ", ".join(args)
+        if rhs_inputs and args: rhs_args += ", "
+
+        return f"{self.id}: {lhs}{self.name} {rhs_args}{rhs_inputs}" + ("   # " + self.type if self.type else "")
+
+    def __repr__(self) -> str:
+        return (
+            f"IR("
+            f"id: {self.id}, "
+            f"name: {self.name!r}, "
+            f"args: {self.args}, "
+            f"inputs: {self.inputs}, "
+            f"outputs: {self.outputs}, "
+            f"type: {self.type}"
+            f")"
+        )
+
+# represents the custom isa
+@dataclass
+class MIR:
+    name: str = ""
+    args: list[str] = field(default_factory=list)
+    definition: list[str] = field(default_factory=list) 
+    inputs: list[list[str]] = field(default_factory=list) 
+    outputs: list[list[str]] = field(default_factory=list) 
+    inouts: list[list[str]] = field(default_factory=list) 
+    spills: list[int] = field(default_factory=list)
+    ir: IR | None = None
+    type: str | None = None
+
+
+    def pretty_MIR(self) -> str:
+        fmt_clusters = lambda clusters: ", ".join(" + ".join(cluster) for cluster in clusters)
+                
+        # Treat inouts as both inputs and outputs
+        all_inputs = self.inputs + self.inouts
+        all_outputs = self.outputs + self.inouts
+
+        if lhs := fmt_clusters(all_outputs):
+            lhs += " = "
+
+        rhs_parts = []
+
+        if self.args:
+            rhs_parts.append(", ".join(self.args))
+
+        if all_inputs:
+            rhs_parts.append(fmt_clusters(all_inputs))
+
+        rhs = ", ".join(rhs_parts)
+
+        return f"{lhs}{self.name} {rhs}".rstrip() + ("   # " + self.type if self.type else "")
+
+    def __repr__(self) -> str:
+        return (
+            f"MIR("
+            f"name: {self.name!r}, "
+            f"args: {self.args}, "
+            f"inputs: {self.inputs}, "
+            f"outputs: {self.outputs}, "
+            f"inouts: {self.inouts}, "
+            f"type: {self.type}"
+            f")"
+        )
+
+
+class Tracer:
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.events = []
+
+    def emit(self, event):
+        if self.enabled:
+            self.events.append(event)
+
+    def __repr__(self) -> str:
+        return "\n".join(self.events)
+
+
+class WatNode:
+    def __init__(self, tag, args=None, children=None, parent=None):
+        self.tag = tag
+        self.args = args or []
+        self.children: list["WatNode"] = children or []
+        self.parent: WatNode | None = parent
+
+    def __repr__(self):
+        return f"(tag: {self.tag}, args: {self.args}, children: {self.children})"
+
+

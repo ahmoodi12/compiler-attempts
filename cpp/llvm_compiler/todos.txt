@@ -1,0 +1,49 @@
+main plan (just to get SOMETHING functional and semi flexible):
+
+translate the incoming llvm ir to only use the supported llvm ir instructions defined in the isa
+
+fill block attrs incoming temps/blocks, exit temps/blocks and result temps
+
+make temp allocator class.
+
+define func params and results
+
+define param and result temps in calls
+simplest way is stack.
+
+handle instruction arguments like resolving branch targets for example
+
+make cfg class
+
+calc blocks preceding and incoming blocks
+
+translate llvm ir into target insts making mir, also lowering temps to machine temps
+
+calc temp life cycles
+
+implement allocating instruction resources using metadata from isa 
+
+emit instructions and labels to compiled code vector
+
+emit global variables at the end of the compiled code.
+
+save into file
+
+
+NOTES:
+    LogicalTemp owns MachineTemps
+
+    MIR only ever sees MachineTemps
+
+
+extras:
+handle llvm builtin funcs
+
+handle phi nodes
+
+implement tracing.
+
+add language (c, c++, rust, etc) -> llvm ir
+
+add asm -> binary via my python assembler
+
